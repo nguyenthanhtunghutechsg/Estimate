@@ -153,6 +153,14 @@ public class AlgoEFIM {
     private long usedHeapBeforeFirstRecursionAfterGc;
     private long availableHeapBeforeFirstRecursionAfterGc;
 
+    /** thống kê ước lượng trong đệ quy */
+    private long estimatedRecursiveMemoryBytesMax;
+    private int estimatedRecursiveMaxItem = -1;
+    private int estimatedRecursiveMaxDepth = -1;
+    private long estimatedRecursiveMaxSupport;
+    private double estimatedRecursiveMaxAvgRemainingLength;
+    private long estimatedRecursiveEstimateCount;
+
     /**
      * Statistics gathered during phase 1 without building the Dataset in memory.
      */
@@ -163,6 +171,7 @@ public class AlgoEFIM {
         long totalItemOccurrences = 0L;
         int[] twu;
         int[] support;
+
 
         Phase1Stats(int maxItem) {
             this.maxItem = maxItem;
@@ -287,6 +296,7 @@ public class AlgoEFIM {
                     System.arraycopy(Transaction.tempUtilities, 0, utilities, 0, keptCount);
                     Transaction.insertionSort(items, utilities);
                     dataset.addTransaction(new Transaction(items, utilities, newTransactionUtility));
+                    dataset.sumLength+=items.length;
                 }
 
                 if (count == maximumTransactionCount) {
@@ -334,6 +344,12 @@ public class AlgoEFIM {
         estimatedFirstRecursionMaxAvgRemainingLength = 0.0;
         usedHeapBeforeFirstRecursionAfterGc = 0L;
         availableHeapBeforeFirstRecursionAfterGc = 0L;
+        estimatedRecursiveMemoryBytesMax = 0L;
+        estimatedRecursiveMaxItem = -1;
+        estimatedRecursiveMaxDepth = -1;
+        estimatedRecursiveMaxSupport = 0L;
+        estimatedRecursiveMaxAvgRemainingLength = 0.0;
+        estimatedRecursiveEstimateCount = 0L;
 
         // save parameters about activating or not the optimizations
         this.activateTransactionMerging = activateTransactionMerging;
@@ -370,6 +386,7 @@ public class AlgoEFIM {
         keptItemOccurrences = totalItemOccurrences - removedItemOccurrences;
         estimatedRemovedDatabasePayloadBytes = removedItemOccurrences * 8L;
         estimatedReducedDatabasePayloadBytes = estimatedInitialDatabasePayloadBytes - estimatedRemovedDatabasePayloadBytes;
+        estimatedReducedDatabasePayloadBytes+=stats.transactionCount*80;
 
         if(DEBUG) {
             System.out.println("===== TWU OF SINGLE ITEMS === ");
@@ -406,6 +423,7 @@ public class AlgoEFIM {
             }
         }
 
+
         if (DEBUG) {
             System.out.println(itemsToKeep);
             System.out.println(Arrays.toString(oldNameToNewNames));
@@ -414,16 +432,36 @@ public class AlgoEFIM {
             System.out.println("Estimated removed payload (bytes): " + estimatedRemovedDatabasePayloadBytes);
             System.out.println("Estimated reduced DB payload (bytes): " + estimatedReducedDatabasePayloadBytes);
         }
-
+        System.gc();
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        usedHeapBeforeFirstRecursionAfterGc = getUsedHeapBytes();
+        availableHeapBeforeFirstRecursionAfterGc = getAvailableHeapBytes();
+        System.out.println(usedHeapBeforeFirstRecursionAfterGc/1024/1024);
         // ============================
         // PHASE 2 - read again and directly build reduced dataset
         // ============================
         Dataset dataset = buildReducedDataset(inputPath, maximumTransactionCount);
         averageReducedTransactionLength = calculateAverageTransactionLength(dataset);
 
+
+        System.gc();
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        usedHeapBeforeFirstRecursionAfterGc = getUsedHeapBytes();
+        availableHeapBeforeFirstRecursionAfterGc = getAvailableHeapBytes();
+        System.out.println(usedHeapBeforeFirstRecursionAfterGc/1024/1024);
+
+
         if(DEBUG) {
             System.out.println("===== Reduced database built in phase 2 === ");
-            System.out.println(dataset.toString());
+
         }
 
         // ============================
@@ -506,7 +544,8 @@ public class AlgoEFIM {
         }
 
         List<Integer> firstItemsToExplore = activateSubtreeUtilityPruning ? itemsToExplore : itemsToKeep;
-        estimateFirstRecursionMemory(itemsToKeep, firstItemsToExplore);
+        itemsToKeep.removeIf(e->e<itemsToExplore.get(0));
+        estimateNextProjectedMemory(itemsToKeep, firstItemsToExplore,renamedItemSupport, averageReducedTransactionLength);
 
         System.gc();
         try {
@@ -517,7 +556,10 @@ public class AlgoEFIM {
         usedHeapBeforeFirstRecursionAfterGc = getUsedHeapBytes();
         availableHeapBeforeFirstRecursionAfterGc = getAvailableHeapBytes();
 
-        printFirstRecursionEstimate();
+
+
+        printCurrentNodeMemoryEstimate(itemsToKeep,itemsToExplore,renamedItemSupport,averageReducedTransactionLength,0,
+                dataset.getTransactions().size());
 
         if(activateSubtreeUtilityPruning){
             backtrackingEFIM(dataset.getTransactions(), itemsToKeep, itemsToExplore, 0);
@@ -595,12 +637,12 @@ public class AlgoEFIM {
         // ========  for each frequent item  e  =============
         for (int j = 0; j < itemsToExplore.size(); j++) {
             Integer e = itemsToExplore.get(j);
-
+            long totalLengthPe = 0L;
             // ========== PERFORM INTERSECTION =====================
             // Calculate transactions containing P U {e}
             // At the same time project transactions to keep what appears after "e"
             List<Transaction> transactionsPe = new ArrayList<Transaction>();
-
+            int[] supportPe = new int[newItemCount + 1];
             // variable to calculate the utility of P U {e}
             int utilityPe = 0;
 
@@ -726,19 +768,13 @@ public class AlgoEFIM {
                                 // if the transaction is not equal to the preceding transaction
                                 // we cannot merge it so we just add it to the database
                                 transactionsPe.add(previousTransaction);
+                                addSupportFromTransaction(supportPe, previousTransaction);
+                                totalLengthPe += previousTransaction.items.length - previousTransaction.offset;
                                 // the transaction becomes the previous transaction
                                 previousTransaction = projectedTransaction;
                                 // and we reset the number of consecutive transactions merged
                                 consecutiveMergeCount = 0;
                             }
-                        }else{
-                            // Otherwise, if merging has been deactivated
-                            // then we just create the projected transaction
-                            Transaction projectedTransaction = new Transaction(transaction, positionE);
-                            // we add the utility of Pe in that transaction to the total utility of Pe
-                            utilityPe  += projectedTransaction.prefixUtility;
-                            // we put the projected transaction in the projected database of Pe
-                            transactionsPe.add(projectedTransaction);
                         }
                     }
                     // This is an optimization for binary search:
@@ -758,6 +794,8 @@ public class AlgoEFIM {
             // Add the last read transaction to the database if there is one
             if(previousTransaction != null){
                 transactionsPe.add(previousTransaction);
+                addSupportFromTransaction(supportPe, previousTransaction);
+                totalLengthPe += previousTransaction.items.length - previousTransaction.offset;
             }
 
             // Append item "e" to P to obtain P U {e}
@@ -803,6 +841,12 @@ public class AlgoEFIM {
                     newItemsToKeep.add(itemk);
                 }
             }
+            double avgLenPe = transactionsPe.isEmpty()
+                    ? 0.0
+                    : (double) totalLengthPe / transactionsPe.size();
+            estimateNextProjectedMemory(newItemsToKeep, newItemsToExplore,supportPe, avgLenPe);
+            printCurrentNodeMemoryEstimate(newItemsToKeep, newItemsToExplore, supportPe, avgLenPe, prefixLength, transactionsPe.size());
+
             // update the total time  for identifying promising items
             timeIdentifyPromisingItems +=  (System.currentTimeMillis() -  initialTime);
 
@@ -1045,16 +1089,13 @@ public class AlgoEFIM {
 
 
     private static final int BYTES_PER_ITEM_AND_UTILITY = 8;
-    private static final int EXTRA_BYTES_PER_TRANSACTION = 8;
+    private static final int EXTRA_BYTES_PER_TRANSACTION = 80;
 
     private double calculateAverageTransactionLength(Dataset dataset) {
         if (dataset == null || dataset.getTransactions().isEmpty()) {
             return 0.0;
         }
-        long totalLength = 0L;
-        for (Transaction transaction : dataset.getTransactions()) {
-            totalLength += transaction.items.length;
-        }
+        long totalLength = dataset.sumLength;
         return (double) totalLength / (double) dataset.getTransactions().size();
     }
 
@@ -1067,89 +1108,203 @@ public class AlgoEFIM {
         return -1;
     }
 
-    private double estimateAverageRemainingLengthAfterItem(int indexInKeep, int totalItemsToKeep) {
-        if (averageReducedTransactionLength <= 0.0 || totalItemsToKeep <= 0 || indexInKeep < 0) {
+
+    private double estimateAverageRemainingLengthAfterItem(double averageLength, int indexInKeep, int totalItemsToKeep) {
+        if (averageLength <= 0.0 || totalItemsToKeep <= 0 || indexInKeep < 0) {
             return 0.0;
         }
+
         double consumedRatio = (double) (indexInKeep + 1) / (double) totalItemsToKeep;
         if (consumedRatio < 0.0) consumedRatio = 0.0;
         if (consumedRatio > 1.0) consumedRatio = 1.0;
-        return Math.max(0.0, averageReducedTransactionLength * (1.0 - consumedRatio));
+
+        return Math.max(0.0, Math.ceil(averageLength * (1.0 - consumedRatio)));
     }
 
-    private void estimateFirstRecursionMemory(List<Integer> itemsToKeep, List<Integer> itemsToExplore) {
-        estimatedFirstRecursionMemoryBytesMax = 0L;
-        estimatedFirstRecursionSupportMin = Long.MAX_VALUE;
-        estimatedFirstRecursionSupportMax = 0L;
-        estimatedFirstRecursionMaxItem = -1;
-        estimatedFirstRecursionMaxAvgRemainingLength = 0.0;
+    private void printCurrentNodeMemoryEstimate(List<Integer> newItemsToKeep,
+                                                List<Integer> newItemsToExplore,
+                                                int[] supportPe,
+                                                double avgLenPe,
+                                                int prefixLength,
+                                                int projectedTransactionCount) {
+        EstimateResult nextEstimate = estimateNextProjectedMemory(
+                newItemsToKeep,
+                newItemsToExplore,
+                supportPe,
+                avgLenPe
+        );
 
-        if (itemsToKeep == null || itemsToKeep.isEmpty() || itemsToExplore == null || itemsToExplore.isEmpty()) {
-            return;
-        }
-        int itemtoKeepsize = itemsToKeep.size();
-        for (Integer item : itemsToKeep){
-            if(item<itemsToExplore.get(0)){
-                itemtoKeepsize--;
-            }
-            if(item==itemsToExplore.get(0)){
-               break;
-            }
+        long usedHeap = getUsedHeapBytes();
+        long availableHeap = getAvailableHeapBytes();
+
+        System.out.println("[EFIM-MEM] itemset=" + formatCurrentItemset(prefixLength)
+                + " | used=" + formatMB(usedHeap)
+                + " MB | free=" + formatMB(availableHeap)
+                + " MB | nextNeed=" + formatMB(nextEstimate.bytes)
+                + " MB | nextItem=" + nextEstimate.item
+                + " | support=" + nextEstimate.support
+                + " | effSupportMerge=" + nextEstimate.effectiveSupportAfterMerge
+                + " | avgRemain=" + nextEstimate.avgRemainingLength
+                + " | possibleSuffix=" + nextEstimate.possibleSuffixes
+                + " | txPe=" + projectedTransactionCount);
+    }
+
+    private EstimateResult estimateNextProjectedMemory(List<Integer> newItemsToKeep,
+                                                       List<Integer> newItemsToExplore,
+                                                       int[] supportPe,
+                                                       double avgLenPe) {
+        EstimateResult result = new EstimateResult();
+
+        if (newItemsToKeep == null || newItemsToKeep.isEmpty()
+                || newItemsToExplore == null || newItemsToExplore.isEmpty()
+                || supportPe == null) {
+            return result;
         }
 
-        for (Integer item : itemsToExplore) {
-            int indexInKeep = findPositionInItemsToKeep(itemsToKeep, item);
-            if (indexInKeep < 0) {
+        List<Integer> nextItems = newItemsToExplore;
+
+        for (Integer item : nextItems) {
+            int indexInKeep = findPositionInItemsToKeep(newItemsToKeep, item);
+            if (indexInKeep < 0 || item < 0 || item >= supportPe.length) {
                 continue;
             }
 
-            long support = renamedItemSupport[item];
-            double avgRemainingLength = estimateAverageRemainingLengthAfterItem(indexInKeep, itemtoKeepsize);
-            long estimatedBytes = (long) Math.ceil(
-                    support * (avgRemainingLength * BYTES_PER_ITEM_AND_UTILITY + EXTRA_BYTES_PER_TRANSACTION)
+            long support = supportPe[item];
+
+            double avgRemainingLength = estimateAverageRemainingLengthAfterItem(
+                    avgLenPe,
+                    indexInKeep,
+                    newItemsToKeep.size()
             );
 
+            int remainingItemCount = newItemsToKeep.size() - indexInKeep;
+            int estimatedSuffixLength = (int) Math.ceil(avgRemainingLength);
+//
+//
+//            double possibleSuffixes = combinationAsDouble(
+//                    estimatedSuffixLength,remainingItemCount
+//            );
+//
+//            long effectiveSupportAfterMerge = (long) Math.min(
+//                    support,
+//                    Math.ceil(possibleSuffixes)
+//            );
+            long estimatedBytes = (long) Math.ceil(
+                    support *
+                            (avgRemainingLength * BYTES_PER_ITEM_AND_UTILITY + EXTRA_BYTES_PER_TRANSACTION)
+            );
 
-            if (estimatedBytes > estimatedFirstRecursionMemoryBytesMax) {
-                estimatedFirstRecursionMemoryBytesMax = estimatedBytes;
-                estimatedFirstRecursionMaxItem = item;
-                estimatedFirstRecursionMaxAvgRemainingLength = avgRemainingLength;
-            }
-            if (support < estimatedFirstRecursionSupportMin) {
-                estimatedFirstRecursionSupportMin = support;
-            }
-            if (support > estimatedFirstRecursionSupportMax) {
-                estimatedFirstRecursionSupportMax = support;
-            }
-
-            if (DEBUG) {
-                System.out.println("[FIRST-EST] item=" + newNamesToOldNames[item]
-                        + " indexInKeep=" + indexInKeep
-                        + " support=" + support
-                        + " avgRemainingLen=" + avgRemainingLength
-                        + " memEstMB=" + (estimatedBytes / 1024.0 / 1024.0));
+            if (estimatedBytes > result.bytes) {
+                result.bytes = estimatedBytes;
+                result.item = item;
+                result.support = support;
+                //result.effectiveSupportAfterMerge = effectiveSupportAfterMerge;
+                result.avgRemainingLength = avgRemainingLength;
+                //result.possibleSuffixes = possibleSuffixes;
             }
         }
+
+        estimatedRecursiveEstimateCount++;
+
+        if (result.bytes > estimatedRecursiveMemoryBytesMax) {
+            estimatedRecursiveMemoryBytesMax = result.bytes;
+            estimatedRecursiveMaxItem = result.item;
+            estimatedRecursiveMaxDepth = -1;
+            estimatedRecursiveMaxSupport = result.support;
+            estimatedRecursiveMaxAvgRemainingLength = result.avgRemainingLength;
+        }
+
+        return result;
     }
 
-    private void printFirstRecursionEstimate() {
-        System.out.println("===== FIRST RECURSION ESTIMATE =====");
-        System.out.println(" Avg reduced transaction length ~: " + averageReducedTransactionLength);
-        System.out.println(" Estimated first-recursion support min ~: "
-                + (estimatedFirstRecursionSupportMin == Long.MAX_VALUE ? 0 : estimatedFirstRecursionSupportMin));
-        System.out.println(" Estimated first-recursion support max ~: " + estimatedFirstRecursionSupportMax);
-        System.out.println(" Estimated first-recursion memory max ~: "
-                + (estimatedFirstRecursionMemoryBytesMax / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Estimated first-recursion max item ~: "
-                + (estimatedFirstRecursionMaxItem == -1 ? -1 : newNamesToOldNames[estimatedFirstRecursionMaxItem]));
-        System.out.println(" Estimated first-recursion max avg remaining length ~: "
-                + estimatedFirstRecursionMaxAvgRemainingLength);
-        System.out.println(" Used heap before first recursion after GC ~: "
-                + (usedHeapBeforeFirstRecursionAfterGc / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Available heap before first recursion after GC ~: "
-                + (availableHeapBeforeFirstRecursionAfterGc / 1024.0 / 1024.0) + " MB");
-        System.out.println("====================================");
+    private static final class EstimateResult {
+        long bytes = 0L;
+        int item = -1;
+        long support = 0L;
+        double avgRemainingLength = 0.0;
+
+        long effectiveSupportAfterMerge = 0L;
+        double possibleSuffixes = 0.0;
     }
+
+    private String formatCurrentItemset(int prefixLength) {
+        StringBuilder builder = new StringBuilder();
+        builder.append('[');
+        for (int i = 0; i <= prefixLength; i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            builder.append(oldNameToNewNames[temp[i]]);
+        }
+        builder.append(']');
+        return builder.toString();
+    }
+
+    private String formatItem(int newItem) {
+        if (newItem <= 0 || newNamesToOldNames == null || newItem >= newNamesToOldNames.length) {
+            return "-";
+        }
+        return String.valueOf(newNamesToOldNames[newItem]);
+    }
+
+    private String formatMB(long bytes) {
+        return String.format("%.2f", bytes / 1024.0 / 1024.0);
+    }
+
+//    private void estimateFirstRecursionMemory(List<Integer> itemsToKeep, List<Integer> itemsToExplore) {
+//        estimatedFirstRecursionMemoryBytesMax = 0L;
+//        estimatedFirstRecursionSupportMin = Long.MAX_VALUE;
+//        estimatedFirstRecursionSupportMax = 0L;
+//        estimatedFirstRecursionMaxItem = -1;
+//        estimatedFirstRecursionMaxAvgRemainingLength = 0.0;
+//
+//        if (itemsToKeep == null || itemsToKeep.isEmpty() || itemsToExplore == null || itemsToExplore.isEmpty()) {
+//            return;
+//        }
+//        int itemtoKeepsize = itemsToKeep.size();
+//        for (Integer item : itemsToKeep){
+//            if(item<itemsToExplore.get(0)){
+//                itemtoKeepsize--;
+//            }
+//            if(item==itemsToExplore.get(0)){
+//                break;
+//            }
+//        }
+//
+//        for (Integer item : itemsToExplore) {
+//            int indexInKeep = findPositionInItemsToKeep(itemsToKeep, item);
+//            if (indexInKeep < 0) {
+//                continue;
+//            }
+//
+//            long support = renamedItemSupport[item];
+//            double avgRemainingLength = estimateAverageRemainingLengthAfterItem(averageReducedTransactionLength,indexInKeep, itemtoKeepsize);
+//            long estimatedBytes = (long) Math.ceil(
+//                    support * (avgRemainingLength * BYTES_PER_ITEM_AND_UTILITY + EXTRA_BYTES_PER_TRANSACTION)
+//            );
+//
+//
+//            if (estimatedBytes > estimatedFirstRecursionMemoryBytesMax) {
+//                estimatedFirstRecursionMemoryBytesMax = estimatedBytes;
+//                estimatedFirstRecursionMaxItem = item;
+//                estimatedFirstRecursionMaxAvgRemainingLength = avgRemainingLength;
+//            }
+//            if (support < estimatedFirstRecursionSupportMin) {
+//                estimatedFirstRecursionSupportMin = support;
+//            }
+//            if (support > estimatedFirstRecursionSupportMax) {
+//                estimatedFirstRecursionSupportMax = support;
+//            }
+//
+//            if (DEBUG) {
+//                System.out.println("[FIRST-EST] item=" + newNamesToOldNames[item]
+//                        + " indexInKeep=" + indexInKeep
+//                        + " support=" + support
+//                        + " avgRemainingLen=" + avgRemainingLength
+//                        + " memEstMB=" + (estimatedBytes / 1024.0 / 1024.0));
+//            }
+//        }
+//    }
 
     public static long getUsedHeapBytes() {
         Runtime rt = Runtime.getRuntime();
@@ -1168,38 +1323,35 @@ public class AlgoEFIM {
      */
     public void printStats() {
 
-        System.out.println("========== EFIM v97 - STATS ============");
-        System.out.println(" minUtil = " + minUtil);
+        System.out.println("========== EFIM STATS ==========");
+        System.out.println(" minUtil: " + minUtil);
         System.out.println(" High utility itemsets count: " + patternCount);
-        System.out.println(" Total time ~: " + (endTimestamp - startTimestamp)
-                + " ms");
-        System.out.println(" Transaction merge count ~: " + mergeCount);
-        System.out.println(" Transaction read count ~: " + transactionReadingCount);
-        System.out.println(" Estimated initial DB payload ~: " + (estimatedInitialDatabasePayloadBytes / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Estimated removed payload ~: " + (estimatedRemovedDatabasePayloadBytes / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Estimated reduced DB payload ~: " + (estimatedReducedDatabasePayloadBytes / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Avg reduced transaction length ~: " + averageReducedTransactionLength);
-        System.out.println(" Estimated first-recursion memory max ~: " + (estimatedFirstRecursionMemoryBytesMax / 1024.0 / 1024.0) + " MB");
-        System.out.println(" Estimated first-recursion max item ~: " + (estimatedFirstRecursionMaxItem == -1 ? -1 : newNamesToOldNames[estimatedFirstRecursionMaxItem]));
-        System.out.println(" Total item occurrences ~: " + totalItemOccurrences);
-        System.out.println(" Removed item occurrences ~: " + removedItemOccurrences);
-        System.out.println(" Kept item occurrences ~: " + keptItemOccurrences);
+        System.out.println(" Total time: " + (endTimestamp - startTimestamp) + " ms");
+        System.out.println(" Max memory: " + MemoryLogger.getInstance().getMaxMemory() + " MB");
+        System.out.println(" Candidate count: " + candidateCount);
+        System.out.println("================================");
+    }
 
-        // if in debug mode, we show more information
-        if(DEBUG) {
-
-            System.out.println(" Time intersections ~: " + timeIntersections
-                    + " ms");
-            System.out.println(" Time database reduction ~: " + timeDatabaseReduction
-                    + " ms");
-            System.out.println(" Time promising items ~: " + timeIdentifyPromisingItems
-                    + " ms");
-            System.out.println(" Time binary search ~: " + timeBinarySearch
-                    + " ms");
-            System.out.println(" Time sort ~: " + timeSort	+ " ms");
+    private void addSupportFromTransaction(int[] supportPe, Transaction transaction) {
+        for (int p = transaction.offset; p < transaction.items.length; p++) {
+            supportPe[transaction.items[p]]++;
         }
-        System.out.println(" Max memory:" + MemoryLogger.getInstance().getMaxMemory());
-        System.out.println(" Candidate count : "             + candidateCount);
-        System.out.println("=====================================");
+    }
+    private double combinationAsDouble(int n, int k) {
+        if (k < 0 || k > n) return 0.0;
+        if (k == 0 || k == n) return 1.0;
+
+        k = Math.min(k, n - k);
+
+        double result = 1.0;
+        for (int i = 1; i <= k; i++) {
+            result = result * (n - k + i) / i;
+
+            if (result > Long.MAX_VALUE) {
+                return Long.MAX_VALUE;
+            }
+        }
+
+        return result;
     }
 }

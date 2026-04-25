@@ -11,10 +11,9 @@ import miners.algorithms.frequentpatterns.efim.Itemsets;
 public class testEFIM_mem {
 
 	public static void main(String [] arg) throws IOException, InterruptedException {
-		String input = "accidents.txt";	// the input and output file paths
+		String input = "chainstore.txt";	// the input and output file paths
 		//int minutil = 12500000;					// the minutil threshold
-		double sumUtil = 1.96141636E+8;
-		int minutil =  (int) Math.round(sumUtil * 0.1);
+		int minutil =  1_500_000;
 		int dbSize = Integer.MAX_VALUE;//(1112949 * 100)/100;
 		AlgoEFIM algo = new AlgoEFIM();				// Create the dEFIM algorithm object
 		

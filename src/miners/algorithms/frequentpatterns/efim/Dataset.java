@@ -35,6 +35,8 @@ public class Dataset {
     /** the largest item name */
     private int maxItem = 0;
 
+    public long sumLength = 0;
+
     /**
      * Constructor
      * @param datasetPath the path of the file containing the dataset
